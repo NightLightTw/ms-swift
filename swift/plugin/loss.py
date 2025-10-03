@@ -323,6 +323,14 @@ def infonce_loss(outputs, labels, loss_scale=None, num_items_in_batch=None, **kw
     hard_negatives = os.environ.get('INFONCE_HARD_NEGATIVES', None)  # how many negative prompts kept in one sample
     # mask out fake negatives
     infonce_mask_fake_negative = strtobool(os.environ.get('INFONCE_MASK_FAKE_NEGATIVE', 'False'))
+
+    trainer = kwargs.get('trainer')
+    batch_inputs = kwargs.get('inputs') or {}
+    tokenizer = getattr(trainer, 'processing_class', None) if trainer is not None else None
+    input_ids = batch_inputs.get('input_ids')
+    attention_mask = batch_inputs.get('attention_mask')
+    need_char_set_mask = bool(infonce_mask_fake_negative and tokenizer is not None and input_ids is not None)
+
     if hard_negatives is not None:
         hard_negatives = int(hard_negatives)
     from swift.utils import get_dist_setting
@@ -345,10 +353,81 @@ def infonce_loss(outputs, labels, loss_scale=None, num_items_in_batch=None, **kw
         labels = [tensor.to(sentences.device) for tensor in labels]
         labels = torch.stack(labels, dim=0)
 
+        if need_char_set_mask:
+            gathered_input_ids = gather_object(input_ids.unsqueeze(0))
+            gathered_input_ids[rank] = input_ids
+            for idx in range(len(gathered_input_ids)):
+                if idx == rank:
+                    continue
+                gathered_input_ids[idx] = gathered_input_ids[idx].to(sentences.device)
+            input_ids = torch.cat(gathered_input_ids, dim=0)
+
+            if attention_mask is not None:
+                gathered_attention = gather_object(attention_mask.unsqueeze(0))
+                gathered_attention[rank] = attention_mask
+                for idx in range(len(gathered_attention)):
+                    if idx == rank:
+                        continue
+                    gathered_attention[idx] = gathered_attention[idx].to(sentences.device)
+                attention_mask = torch.cat(gathered_attention, dim=0)
+
     # split tensors into single sample
     # for example: batch_size=2 with tensor anchor(1)+positive(1)+negatives(3) + anchor(1)+positive(1)+negatives(2)
     # labels will be [1,0,0,0,1,0,0], meaning 1 positive, 3 negatives, 1 positive, 2 negatives
+    rng_state_before = np.random.get_state()
     split_tensors = _parse_multi_negative_sentences(sentences, labels, hard_negatives)
+    rng_state_after = np.random.get_state()
+
+    split_input_ids = None
+    split_attention_masks = None
+    if need_char_set_mask:
+        np.random.set_state(rng_state_before)
+        split_input_ids = _parse_multi_negative_sentences(input_ids, labels, hard_negatives)
+        if attention_mask is not None:
+            split_attention_masks = _parse_multi_negative_sentences(attention_mask, labels, hard_negatives)
+        np.random.set_state(rng_state_after)
+
+    sample_char_sets = None
+    if need_char_set_mask and split_input_ids is not None:
+
+        def _decode_ids(ids_list):
+            try:
+                if hasattr(tokenizer, 'decode'):
+                    return tokenizer.decode(ids_list, skip_special_tokens=True)
+                if hasattr(tokenizer, 'batch_decode'):
+                    decoded = tokenizer.batch_decode([ids_list], skip_special_tokens=True)
+                    return decoded[0] if decoded else None
+            except Exception:
+                return None
+            return None
+
+        def _compute_char_set(ids_tensor, mask_tensor):
+            ids_cpu = ids_tensor.detach().cpu()
+            if mask_tensor is not None:
+                mask_cpu = mask_tensor.detach().cpu().bool()
+                ids_cpu = ids_cpu[mask_cpu]
+            ids_list = ids_cpu.tolist()
+            if len(ids_list) == 0:
+                return None
+            decoded = _decode_ids(ids_list)
+            if not decoded:
+                return None
+            filtered = [ch for ch in decoded if not ch.isspace()]
+            if not filtered:
+                return None
+            return frozenset(filtered)
+
+        sample_char_sets = []
+        for idx, token_tensor in enumerate(split_input_ids):
+            attn_tensor = split_attention_masks[idx] if split_attention_masks is not None else None
+            sample_sets = []
+            for seq_idx in range(token_tensor.size(0)):
+                attn_seq = attn_tensor[seq_idx] if attn_tensor is not None else None
+                sample_sets.append(_compute_char_set(token_tensor[seq_idx], attn_seq))
+            sample_char_sets.append(sample_sets)
+        if not any(len(sample_sets) > 1 and sample_sets[1] is not None for sample_sets in sample_char_sets):
+            sample_char_sets = None
+
     loss = 0
     can_batched = hard_negatives is not None
     if hard_negatives is None and len(set([s.shape[0] for s in split_tensors])) == 1:
@@ -362,33 +441,85 @@ def infonce_loss(outputs, labels, loss_scale=None, num_items_in_batch=None, **kw
             sentences = torch.stack(split_tensors, dim=0)
             # [B, 1, D] * [B, neg+1, D]
             similarity_matrix = torch.matmul(sentences[:, 0:1], sentences[:, 1:].transpose(1, 2)) / temperature
+            if need_char_set_mask and sample_char_sets is not None:
+                mask_rows = []
+                for sample_sets in sample_char_sets:
+                    candidate_sets = sample_sets[1:]
+                    sample_mask = torch.zeros(len(candidate_sets), dtype=torch.bool, device=sentences.device)
+                    if candidate_sets:
+                        pos_set = candidate_sets[0]
+                        if pos_set is not None:
+                            for cand_idx, cand_set in enumerate(candidate_sets[1:], start=1):
+                                if cand_set == pos_set:
+                                    sample_mask[cand_idx] = True
+                    mask_rows.append(sample_mask)
+                if mask_rows:
+                    mask_tensor = torch.stack(mask_rows, dim=0)
+                    similarity_matrix[:, 0, :][mask_tensor] = float('-inf')
             # The positive one is the first element
             labels = torch.zeros(len(split_tensors), dtype=torch.int64).to(sentences.device)
             loss = nn.CrossEntropyLoss()(similarity_matrix.squeeze(1), labels)
         else:
             # the negative numbers may be different, use for loop
-            for tensor in split_tensors:
+            for idx, tensor in enumerate(split_tensors):
                 # [D] * [neg+1, D]
                 similarity_matrix = torch.matmul(tensor[0], tensor[1:].T) / temperature
+                if need_char_set_mask and sample_char_sets is not None and idx < len(sample_char_sets):
+                    candidate_sets = sample_char_sets[idx][1:]
+                    if candidate_sets:
+                        pos_set = candidate_sets[0]
+                        if pos_set is not None:
+                            for cand_idx, cand_set in enumerate(candidate_sets[1:], start=1):
+                                if cand_set == pos_set:
+                                    similarity_matrix[cand_idx] = float('-inf')
                 # The positive one is the first element
                 labels = torch.tensor(0).to(tensor.device)
                 loss += nn.CrossEntropyLoss()(similarity_matrix, labels)
             # avg between all batches in one gpu
             loss /= len(split_tensors)
     else:
+        char_set_to_columns = None
+        positive_char_sets = None
+        num_candidates_per_sample = None
 
         def mask_fake_negative(sim_matrix, sim_labels):
             thresholds = sim_matrix[torch.arange(sim_matrix.size(0)), sim_labels].view(-1, 1) + 0.1
             thresholds = thresholds.detach()
             mask = sim_matrix > thresholds
             sim_matrix[mask] = float('-inf')
+            if (char_set_to_columns is not None and positive_char_sets is not None
+                    and num_candidates_per_sample is not None):
+                for row_idx, pos_set in enumerate(positive_char_sets):
+                    if pos_set is None:
+                        continue
+                    candidate_indices = [
+                        col for col in char_set_to_columns.get(pos_set, [])
+                        if col != row_idx * num_candidates_per_sample
+                    ]
+                    if candidate_indices:
+                        index_tensor = torch.as_tensor(candidate_indices,
+                                                         dtype=torch.long,
+                                                         device=sim_matrix.device)
+                        sim_matrix[row_idx, index_tensor] = float('-inf')
 
         if can_batched:
             # [B, neg+2, D]
             sentences = torch.stack(split_tensors, dim=0)
+            num_candidates_per_sample = sentences.size(1) - 1
+            if need_char_set_mask and sample_char_sets is not None:
+                char_set_to_columns = {}
+                positive_char_sets = []
+                for sample_idx, sample_sets in enumerate(sample_char_sets):
+                    pos_set = sample_sets[1] if len(sample_sets) > 1 else None
+                    positive_char_sets.append(pos_set)
+                    for cand_offset, char_set in enumerate(sample_sets[1:]):
+                        if char_set is None:
+                            continue
+                        column_idx = sample_idx * num_candidates_per_sample + cand_offset
+                        char_set_to_columns.setdefault(char_set, []).append(column_idx)
             # [B, D] * [B*(neg+1), D]
-            similarity_matrix = torch.matmul(sentences[:, 0].squeeze(1), sentences[:,
-                                                                                   1:].reshape(-1, sentences.size(2)).T)
+            similarity_matrix = torch.matmul(sentences[:, 0].squeeze(1),
+                                             sentences[:, 1:].reshape(-1, sentences.size(2)).T)
             labels = torch.tensor(range(0,
                                         sentences.size(0) * (sentences.size(1) - 1),
                                         sentences.size(1) - 1)).view(-1).to(sentences.device)
