@@ -912,8 +912,23 @@ class DataLoaderMixin:
             }
 
             if hasattr(train_dataset, '__len__'):
-                batch_sampler = BatchSamplerShard(
-                    len(train_dataset), batch_size=self._train_batch_size, **batch_sampler_params)
+                # Check if using zone-based sampling for curriculum learning
+                use_zone_sampler = getattr(args, 'use_zone_sampler', False)
+                num_zones = getattr(args, 'num_zones', None)
+                
+                if use_zone_sampler and num_zones:
+                    from swift.llm.data_loader import ZoneBasedBatchSampler
+                    print(f"Using zone-based sampling with {num_zones} zones")
+                    batch_sampler = ZoneBasedBatchSampler(
+                        len(train_dataset), 
+                        batch_size=self._train_batch_size, 
+                        num_zones=num_zones,
+                        **batch_sampler_params
+                    )
+                else:
+                    batch_sampler = BatchSamplerShard(
+                        len(train_dataset), batch_size=self._train_batch_size, **batch_sampler_params)
+                
                 dataloader_params['worker_init_fn'] = partial(
                     seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index)
                 if skip_batches > 0:

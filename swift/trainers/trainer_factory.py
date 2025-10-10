@@ -62,9 +62,20 @@ class TrainerFactory:
         args_dict = asdict(args)
         parameters = inspect.signature(training_args_cls).parameters
 
-        for k in list(args_dict.keys()):
-            if k not in parameters:
-                args_dict.pop(k)
+        # Separate standard parameters from custom parameters
+        standard_args = {}
+        custom_args = {}
+        for k, v in args_dict.items():
+            if k in parameters:
+                standard_args[k] = v
+            else:
+                custom_args[k] = v
 
-        args._prepare_training_args(args_dict)
-        return training_args_cls(**args_dict)
+        args._prepare_training_args(standard_args)
+        training_args = training_args_cls(**standard_args)
+        
+        # Add custom parameters as attributes
+        for k, v in custom_args.items():
+            setattr(training_args, k, v)
+            
+        return training_args
